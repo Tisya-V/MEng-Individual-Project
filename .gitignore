@@ -1,0 +1,4 @@
+.venv
+
+# ignore data files (e.g. eval sets, intermediate CSVs)
+*.csv

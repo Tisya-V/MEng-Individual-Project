@@ -3,8 +3,9 @@
 # ignore data files (e.g. eval sets, intermediate CSVs)
 *.jsonl
 *.png
+*.csv
 
-
+data/
 results/
 tmp/
 runs/

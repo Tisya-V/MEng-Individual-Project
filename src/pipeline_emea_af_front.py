@@ -3,25 +3,22 @@
 # Constructs Accuracy-Fluency Pareto fronts for multiple en-fr datasets
 # via oracle reranking over K sampled candidates, replicating Flamich et al.
 #
-# Stages (each checkpointed per dataset):
-#   1. Load & sample eval set      -> data/{name}_eval.csv
-#   2. Generate K candidates       -> data/{name}_candidates.jsonl
-#   3. Score adequacy (chrF)       -> data/{name}_scored_adq.jsonl
-#   4. Score fluency (log-ppl)     -> data/{name}_scored_flu.jsonl
-#   5. Oracle rerank across beta   -> results/{name}_af_front.csv
-#   6. Per-dataset plots           -> results/{name}_af_front.png
-#   7. Combined plot               -> results/combined_af_front.png
+# Stages (each checkpointed per dataset, under runs/n_{N}_k_{K}/):
+#   1. Load & sample eval set      -> {RUN_DIR}/data/{name}_eval.csv
+#   2. Generate K candidates       -> {RUN_DIR}/data/{name}_candidates.jsonl
+#   3. Score adequacy (chrF)       -> {RUN_DIR}/data/{name}_scored_adq.jsonl
+#   4. Score fluency (log-ppl)     -> {RUN_DIR}/data/{name}_scored_flu.jsonl
+#   5. Oracle rerank across beta   -> {RUN_DIR}/results/{name}_af_front.csv
+#   6. Per-dataset plots           -> {RUN_DIR}/results/{name}_af_front.png
+#   7. Combined plot               -> {RUN_DIR}/results/combined_af_front.png
+#   0. Config snapshot             -> {RUN_DIR}/config.txt
 
 import random
-import urllib.request
-import zipfile
-import io
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from tqdm.auto import tqdm
 import torch
-from datasets import load_dataset
 from transformers import (
     MBartForConditionalGeneration,
     MBart50TokenizerFast,
@@ -34,8 +31,8 @@ import matplotlib.pyplot as plt
 # ── Config ────────────────────────────────────────────────────────────────────
 
 SEED        = 42
-EVAL_SIZE   = 16
-K           = 4
+N           = 300
+K           = 128
 MAX_NEW_TOK = 128
 TOP_P       = 0.9
 TEMPERATURE = 1.0
@@ -49,62 +46,65 @@ BETAS = [1e-4, 1e-3, 5e-3, 1e-2, 5e-2,
          0.1, 0.2, 0.5, 1.0, 2.0, 5.0,
          10.0, 50.0, 100.0, 1e3, 1e4]
 
-DATA_DIR   = Path("data");    DATA_DIR.mkdir(exist_ok=True)
-RESULT_DIR = Path("results"); RESULT_DIR.mkdir(exist_ok=True)
+# ── Run directory (all outputs scoped here) ───────────────────────────────────
+
+RUN_DIR    = Path(f"runs/n{N}_k{K}")
+DATA_DIR   = RUN_DIR / "data";    DATA_DIR.mkdir(parents=True, exist_ok=True)
+RESULT_DIR = RUN_DIR / "results"; RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+SPLITS_DIR = Path("data/splits")
+
+# ── Config snapshot ───────────────────────────────────────────────────────────
+
+def write_config():
+    cfg_path = RUN_DIR / "config.txt"
+    if cfg_path.exists():
+        return
+    lines = [
+        f"SEED        = {SEED}",
+        f"N           = {N}",
+        f"K           = {K}",
+        f"MAX_NEW_TOK = {MAX_NEW_TOK}",
+        f"TOP_P       = {TOP_P}",
+        f"TEMPERATURE = {TEMPERATURE}",
+        f"",
+        f"MT_MODEL    = {MT_MODEL}",
+        f"LM_MODEL    = {LM_MODEL}",
+        f"SRC_LANG    = {SRC_LANG}",
+        f"TGT_LANG    = {TGT_LANG}",
+        f"",
+        f"BETAS       = {BETAS}",
+    ]
+    cfg_path.write_text("\n".join(lines))
+    print(f"Config saved to {cfg_path}")
+
+# ── Seeding ───────────────────────────────────────────────────────────────────
 
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
+print(f"Run directory: {RUN_DIR}")
 
 # ── Dataset registry ──────────────────────────────────────────────────────────
-# To add a new dataset, add an entry here with a `load_fn` that returns
-# a list of {"src_en": ..., "ref_fr": ...} dicts.
-
-def load_emea(n: int) -> list[dict]:
-    url = "https://object.pouta.csc.fi/OPUS-EMEA/v3/moses/en-fr.txt.zip"
-    with urllib.request.urlopen(url) as r:
-        z = zipfile.ZipFile(io.BytesIO(r.read()))
-        en_lines = z.read("EMEA.en-fr.en").decode().splitlines()
-        fr_lines = z.read("EMEA.en-fr.fr").decode().splitlines()
-    paired = list(zip(en_lines, fr_lines))
-    random.shuffle(paired)
-    return [{"src_en": e, "ref_fr": f} for e, f in paired[:n]]
-
-def load_news_commentary(n: int) -> list[dict]:
-    ds = load_dataset("Helsinki-NLP/news_commentary", "en-fr")
-    split = list(ds.keys())[0]
-    data  = ds[split].shuffle(seed=SEED).select(range(min(n, len(ds[split]))))
-    return [{"src_en": data[i]["translation"]["en"],
-             "ref_fr": data[i]["translation"]["fr"]} for i in range(len(data))]
-
-def load_opus_books(n: int) -> list[dict]:
-    ds    = load_dataset("Helsinki-NLP/opus_books", "en-fr")
-    split = list(ds.keys())[0]
-    data  = ds[split].shuffle(seed=SEED).select(range(min(n, len(ds[split]))))
-    return [{"src_en": data[i]["translation"]["en"],
-             "ref_fr": data[i]["translation"]["fr"]} for i in range(len(data))]
 
 DATASETS = {
-    "emea":             {"load_fn": load_emea,             "label": "EMEA (Medical)"},
-    "news_commentary":  {"load_fn": load_news_commentary,  "label": "News Commentary"},
-    "opus_books":       {"load_fn": load_opus_books,       "label": "Opus Books (Literary)"},
+    "emea":            {"label": "EMEA (Medical)"},
+    "news_commentary": {"label": "News Commentary"},
+    "opus_books":      {"label": "Opus Books (Literary)"},
 }
 
 # ── Stage functions ───────────────────────────────────────────────────────────
 
 def stage1_load(name: str, cfg: dict) -> pd.DataFrame:
-    path = DATA_DIR / f"{name}_eval.csv"
-    if path.exists():
-        print(f"[{name}][Stage 1] Skipping — found {path}")
-        return pd.read_csv(path)
-    print(f"[{name}][Stage 1] Loading dataset...")
-    rows = cfg["load_fn"](EVAL_SIZE)
-    if not rows:
-        raise RuntimeError(f"[{name}] load_fn returned empty/None — check loader.")
-    df   = pd.DataFrame([{"id": i, **r} for i, r in enumerate(rows)])
-    df.to_csv(path, index=False)
-    print(f"[{name}][Stage 1] Saved {len(df)} sentences.")
-    return df
+    split_path = SPLITS_DIR / f"{name}_dev.csv"
+    if not split_path.exists():
+        raise RuntimeError(
+            f"Split file not found: {split_path}\n"
+            f"Run `python split_data.py` first to generate fixed splits."
+        )
+
+    print(f"[{name}][Stage 1] Loading dev split from {split_path}")
+    return pd.read_csv(split_path)
 
 
 def stage2_generate(name: str, eval_df: pd.DataFrame,
@@ -122,7 +122,7 @@ def stage2_generate(name: str, eval_df: pd.DataFrame,
             out = mt_model.generate(
                 **inputs, do_sample=True, top_p=TOP_P, temperature=TEMPERATURE,
                 max_new_tokens=MAX_NEW_TOK, forced_bos_token_id=forced_bos,
-                num_return_sequences=K,
+                num_return_sequences=K, num_beams=1,
             )
         return [mt_tokenizer.decode(o, skip_special_tokens=True) for o in out]
 
@@ -207,12 +207,12 @@ def plot_single(name: str, label: str,
     baseline_fluency = scored_df.groupby("id")["fluency"].mean().mean()
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(front_df["chrf"], front_df["fluency"],
-            marker="o", linewidth=2.5, markersize=7, label=f"Oracle front")
+            marker="o", linewidth=2.5, markersize=7, label="Oracle front")
     ax.scatter([baseline_chrf], [baseline_fluency],
                marker="x", s=120, linewidths=2.5, zorder=5, label="Mean candidate baseline")
     ax.set_xlabel("Adequacy (chrF)")
     ax.set_ylabel("Fluency (neg-NLL)")
-    ax.set_title(f"A-F Oracle Front — {label}\nOracle reranking over K={K} candidates")
+    ax.set_title(f"A-F Oracle Front — {label}\nN={N}, K={K}")
     ax.legend(); ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(str(path), dpi=150)
@@ -235,7 +235,7 @@ def plot_combined(results: dict):
                    s=120, linewidths=2.5, color=line.get_color(), zorder=5)
     ax.set_xlabel("Adequacy (chrF)")
     ax.set_ylabel("Fluency (neg-NLL)")
-    ax.set_title(f"A-F Oracle Fronts — All Domains\n× = mean candidate baseline per domain")
+    ax.set_title(f"A-F Oracle Fronts — All Domains (N={N}, K={K})\nx = mean candidate baseline per domain")
     ax.legend(); ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(str(path), dpi=150)
@@ -245,7 +245,8 @@ def plot_combined(results: dict):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # Load MT model once, run stage 2 for all datasets, then free
+    write_config()
+
     mt_needed = any(
         not (DATA_DIR / f"{name}_candidates.jsonl").exists()
         for name in DATASETS
@@ -268,10 +269,8 @@ def main():
     if mt_model is not None:
         del mt_model, mt_tokenizer; torch.cuda.empty_cache()
 
-    # Stage 3: chrF — no model needed
     chrf_dfs = {name: stage3_score_adequacy(name, cand_dfs[name]) for name in DATASETS}
 
-    # Load LM once, run stage 4 for all datasets, then free
     lm_needed = any(
         not (DATA_DIR / f"{name}_scored_flu.jsonl").exists()
         for name in DATASETS
@@ -290,7 +289,6 @@ def main():
     if lm_model is not None:
         del lm_model, lm_tokenizer; torch.cuda.empty_cache()
 
-    # Stages 5 & 6
     results = {}
     for name, cfg in DATASETS.items():
         front_df = stage5_rerank(name, scored_dfs[name])

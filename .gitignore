@@ -5,6 +5,10 @@
 *.jsonl
 *.png
 
+
 data/
 results/
 tmp/
+runs/
+build/
+*.egg-info/

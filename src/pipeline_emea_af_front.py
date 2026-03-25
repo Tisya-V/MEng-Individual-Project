@@ -27,32 +27,9 @@ from transformers import (
 )
 import sacrebleu
 import matplotlib.pyplot as plt
+from config import *
 
-# ── Config ────────────────────────────────────────────────────────────────────
-
-SEED        = 42
-N           = 300
-K           = 128
-MAX_NEW_TOK = 128
-TOP_P       = 0.9
-TEMPERATURE = 1.0
-
-MT_MODEL = "facebook/mbart-large-50-many-to-many-mmt"
-LM_MODEL = "asi/gpt-fr-cased-small"
-SRC_LANG = "en_XX"
-TGT_LANG = "fr_XX"
-
-BETAS = [1e-4, 1e-3, 5e-3, 1e-2, 5e-2,
-         0.1, 0.2, 0.5, 1.0, 2.0, 5.0,
-         10.0, 50.0, 100.0, 1e3, 1e4]
-
-# ── Run directory (all outputs scoped here) ───────────────────────────────────
-
-RUN_DIR    = Path(f"runs/n{N}_k{K}")
-DATA_DIR   = RUN_DIR / "data";    DATA_DIR.mkdir(parents=True, exist_ok=True)
-RESULT_DIR = RUN_DIR / "results"; RESULT_DIR.mkdir(parents=True, exist_ok=True)
-
-SPLITS_DIR = Path("data/splits")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ── Config snapshot ───────────────────────────────────────────────────────────
 

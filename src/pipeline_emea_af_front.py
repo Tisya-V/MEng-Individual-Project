@@ -4,14 +4,17 @@
 # via oracle reranking over K sampled candidates, replicating Flamich et al.
 #
 # Stages (each checkpointed per dataset, under runs/n_{N}_k_{K}/):
+#   0. Config snapshot             -> {RUN_DIR}/config.txt
 #   1. Load & sample eval set      -> {RUN_DIR}/data/{name}_eval.csv
 #   2. Generate K candidates       -> {RUN_DIR}/data/{name}_candidates.jsonl
+#   2b. Greedy/beam baseline       -> {RUN_DIR}/data/{name}_greedy.jsonl
 #   3. Score adequacy (chrF)       -> {RUN_DIR}/data/{name}_scored_adq.jsonl
 #   4. Score fluency (log-ppl)     -> {RUN_DIR}/data/{name}_scored_flu.jsonl
+#   3b/4b. Score greedy baseline   -> {RUN_DIR}/data/{name}_greedy_scored.jsonl
 #   5. Oracle rerank across beta   -> {RUN_DIR}/results/{name}_af_front.csv
 #   6. Per-dataset plots           -> {RUN_DIR}/results/{name}_af_front.png
 #   7. Combined plot               -> {RUN_DIR}/results/combined_af_front.png
-#   0. Config snapshot             -> {RUN_DIR}/config.txt
+
 
 import random
 import numpy as np
@@ -29,7 +32,23 @@ import sacrebleu
 import matplotlib.pyplot as plt
 from config import *
 
+
+# ── Seeding ───────────────────────────────────────────────────────────────────
+
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+print(f"Run directory: {RUN_DIR}")
+
+
+# ── Dataset registry ──────────────────────────────────────────────────────────
+
+DATASETS = {
+    "emea":            {"label": "EMEA (Medical)"},
+    "news_commentary": {"label": "News Commentary"},
+    "opus_books":      {"label": "Opus Books (Literary)"},
+}
+
 
 # ── Config snapshot ───────────────────────────────────────────────────────────
 
@@ -55,20 +74,6 @@ def write_config():
     cfg_path.write_text("\n".join(lines))
     print(f"Config saved to {cfg_path}")
 
-# ── Seeding ───────────────────────────────────────────────────────────────────
-
-random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-print(f"Run directory: {RUN_DIR}")
-
-# ── Dataset registry ──────────────────────────────────────────────────────────
-
-DATASETS = {
-    "emea":            {"label": "EMEA (Medical)"},
-    "news_commentary": {"label": "News Commentary"},
-    "opus_books":      {"label": "Opus Books (Literary)"},
-}
 
 # ── Stage functions ───────────────────────────────────────────────────────────
 
@@ -79,7 +84,6 @@ def stage1_load(name: str, cfg: dict) -> pd.DataFrame:
             f"Split file not found: {split_path}\n"
             f"Run `python split_data.py` first to generate fixed splits."
         )
-
     print(f"[{name}][Stage 1] Loading dev split from {split_path}")
     return pd.read_csv(split_path)
 
@@ -98,7 +102,7 @@ def stage2_generate(name: str, eval_df: pd.DataFrame,
         with torch.no_grad():
             out = mt_model.generate(
                 **inputs, do_sample=True, top_p=TOP_P, temperature=TEMPERATURE,
-                max_new_tokens=MAX_NEW_TOK, forced_bos_token_id=forced_bos,
+                max_new_tokens=MAX_NEW_TOK, forced_bos_token_id=forced_bos, max_length=None,
                 num_return_sequences=K, num_beams=1,
             )
         return [mt_tokenizer.decode(o, skip_special_tokens=True) for o in out]
@@ -112,6 +116,34 @@ def stage2_generate(name: str, eval_df: pd.DataFrame,
     df = pd.DataFrame(rows)
     df.to_json(path, orient="records", lines=True, force_ascii=False)
     print(f"[{name}][Stage 2] Saved {len(df)} candidates.")
+    return df
+
+
+def stage2b_greedy(name: str, eval_df: pd.DataFrame,
+                   mt_model, mt_tokenizer) -> pd.DataFrame:
+    path = DATA_DIR / f"{name}_greedy.jsonl"
+    if path.exists():
+        print(f"[{name}][Stage 2b] Skipping — found {path}")
+        return pd.read_json(path, orient="records", lines=True)
+    forced_bos = mt_tokenizer.lang_code_to_id[TGT_LANG]
+    rows = []
+    for row in tqdm(eval_df.itertuples(index=False), total=len(eval_df),
+                    desc=f"[{name}] Greedy decode"):
+        inputs = mt_tokenizer(row.src_en, return_tensors="pt",
+                              truncation=True, max_length=256).to(device)
+        with torch.no_grad():
+            out = mt_model.generate(
+                **inputs, do_sample=False, num_beams=4,
+                max_new_tokens=MAX_NEW_TOK,
+                forced_bos_token_id=forced_bos,
+                max_length=None,
+            )
+        hyp = mt_tokenizer.decode(out[0], skip_special_tokens=True)
+        rows.append({"id": int(row.id), "src_en": row.src_en,
+                     "ref_fr": row.ref_fr, "hyp_fr": hyp})
+    df = pd.DataFrame(rows)
+    df.to_json(path, orient="records", lines=True, force_ascii=False)
+    print(f"[{name}][Stage 2b] Saved {len(df)} greedy decodes.")
     return df
 
 
@@ -139,10 +171,20 @@ def stage4_score_fluency(name: str, chrf_df: pd.DataFrame,
         return pd.read_json(path, orient="records", lines=True)
 
     def log_ppl(text: str) -> float:
+        # Guard against empty strings
+        if not text or not text.strip():
+            return 50  # Treat empty hypothesis as maximally disfluent
+        
         enc = lm_tokenizer(text, return_tensors="pt",
-                           truncation=True, max_length=256).to(device)
+                        truncation=True, max_length=256).to(device)
+        
+        # Guard: tokenizer may still produce 0 tokens for unusual inputs
+        if enc["input_ids"].shape[-1] == 0:
+            return 50
+        
         with torch.no_grad():
             return lm_model(**enc, labels=enc["input_ids"]).loss.item()
+
 
     chrf_df["log_ppl"] = [
         log_ppl(row.hyp_fr)
@@ -153,6 +195,39 @@ def stage4_score_fluency(name: str, chrf_df: pd.DataFrame,
     chrf_df.to_json(path, orient="records", lines=True, force_ascii=False)
     print(f"[{name}][Stage 4] Saved fluency scores.")
     return chrf_df
+
+
+def score_greedy(name: str, greedy_df: pd.DataFrame,
+                 lm_model, lm_tokenizer) -> dict:
+    """Scores the greedy baseline outputs and returns mean chrF and fluency."""
+    path = DATA_DIR / f"{name}_greedy_scored.jsonl"
+    if path.exists():
+        print(f"[{name}][Stage 3b/4b] Skipping — found {path}")
+        df = pd.read_json(path, orient="records", lines=True)
+        return {"chrf": df["chrf"].mean(), "fluency": df["fluency"].mean()}
+
+    chrf_metric = sacrebleu.CHRF()
+    greedy_df["chrf"] = [
+        chrf_metric.sentence_score(r.hyp_fr, [r.ref_fr]).score
+        for r in tqdm(greedy_df.itertuples(index=False), total=len(greedy_df),
+                      desc=f"[{name}] Greedy chrF")
+    ]
+
+    def log_ppl(text: str) -> float:
+        enc = lm_tokenizer(text, return_tensors="pt",
+                           truncation=True, max_length=256).to(device)
+        with torch.no_grad():
+            return lm_model(**enc, labels=enc["input_ids"]).loss.item()
+
+    greedy_df["log_ppl"] = [
+        log_ppl(r.hyp_fr)
+        for r in tqdm(greedy_df.itertuples(index=False), total=len(greedy_df),
+                      desc=f"[{name}] Greedy fluency")
+    ]
+    greedy_df["fluency"] = -greedy_df["log_ppl"]
+    greedy_df.to_json(path, orient="records", lines=True, force_ascii=False)
+    print(f"[{name}][Stage 3b/4b] Saved greedy scores.")
+    return {"chrf": greedy_df["chrf"].mean(), "fluency": greedy_df["fluency"].mean()}
 
 
 def stage5_rerank(name: str, scored_df: pd.DataFrame) -> pd.DataFrame:
@@ -175,18 +250,17 @@ def stage5_rerank(name: str, scored_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def plot_single(name: str, label: str,
-                front_df: pd.DataFrame, scored_df: pd.DataFrame):
+                front_df: pd.DataFrame, baseline: dict):
     path = RESULT_DIR / f"{name}_af_front.png"
     if path.exists():
         print(f"[{name}][Stage 6] Skipping — found {path}")
         return
-    baseline_chrf    = scored_df.groupby("id")["chrf"].mean().mean()
-    baseline_fluency = scored_df.groupby("id")["fluency"].mean().mean()
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(front_df["chrf"], front_df["fluency"],
             marker="o", linewidth=2.5, markersize=7, label="Oracle front")
-    ax.scatter([baseline_chrf], [baseline_fluency],
-               marker="x", s=120, linewidths=2.5, zorder=5, label="Mean candidate baseline")
+    ax.scatter([baseline["chrf"]], [baseline["fluency"]],
+               marker="x", s=120, linewidths=2.5, zorder=5,
+               label="Beam decode (baseline)")
     ax.set_xlabel("Adequacy (chrF)")
     ax.set_ylabel("Fluency (neg-NLL)")
     ax.set_title(f"A-F Oracle Front — {label}\nN={N}, K={K}")
@@ -203,29 +277,31 @@ def plot_combined(results: dict):
         print("[Combined] Skipping — found combined plot.")
         return
     fig, ax = plt.subplots(figsize=(9, 6))
-    for name, (front_df, scored_df, label) in results.items():
-        baseline_chrf    = scored_df.groupby("id")["chrf"].mean().mean()
-        baseline_fluency = scored_df.groupby("id")["fluency"].mean().mean()
+    for name, (front_df, baseline, label) in results.items():
         line, = ax.plot(front_df["chrf"], front_df["fluency"],
                         marker="o", linewidth=2.5, markersize=7, label=label)
-        ax.scatter([baseline_chrf], [baseline_fluency], marker="x",
+        ax.scatter([baseline["chrf"]], [baseline["fluency"]], marker="x",
                    s=120, linewidths=2.5, color=line.get_color(), zorder=5)
     ax.set_xlabel("Adequacy (chrF)")
     ax.set_ylabel("Fluency (neg-NLL)")
-    ax.set_title(f"A-F Oracle Fronts — All Domains (N={N}, K={K})\nx = mean candidate baseline per domain")
+    ax.set_title(f"A-F Oracle Fronts — All Domains (N={N}, K={K})\nx = beam decode baseline per domain")
     ax.legend(); ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(str(path), dpi=150)
     plt.close()
     print("[Combined] Saved combined plot.")
 
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    for d in [RUN_DIR, DATA_DIR, RESULT_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
     write_config()
 
     mt_needed = any(
         not (DATA_DIR / f"{name}_candidates.jsonl").exists()
+        or not (DATA_DIR / f"{name}_greedy.jsonl").exists()
         for name in DATASETS
     )
     if mt_needed:
@@ -237,11 +313,13 @@ def main():
     else:
         mt_model = mt_tokenizer = None
 
-    eval_dfs = {}
-    cand_dfs = {}
+    eval_dfs   = {}
+    cand_dfs   = {}
+    greedy_dfs = {}
     for name, cfg in DATASETS.items():
-        eval_dfs[name] = stage1_load(name, cfg)
-        cand_dfs[name] = stage2_generate(name, eval_dfs[name], mt_model, mt_tokenizer)
+        eval_dfs[name]   = stage1_load(name, cfg)
+        cand_dfs[name]   = stage2_generate(name, eval_dfs[name], mt_model, mt_tokenizer)
+        greedy_dfs[name] = stage2b_greedy(name, eval_dfs[name], mt_model, mt_tokenizer)
 
     if mt_model is not None:
         del mt_model, mt_tokenizer; torch.cuda.empty_cache()
@@ -250,6 +328,7 @@ def main():
 
     lm_needed = any(
         not (DATA_DIR / f"{name}_scored_flu.jsonl").exists()
+        or not (DATA_DIR / f"{name}_greedy_scored.jsonl").exists()
         for name in DATASETS
     )
     if lm_needed:
@@ -260,8 +339,10 @@ def main():
     else:
         lm_model = lm_tokenizer = None
 
-    scored_dfs = {name: stage4_score_fluency(name, chrf_dfs[name], lm_model, lm_tokenizer)
-                  for name in DATASETS}
+    scored_dfs      = {name: stage4_score_fluency(name, chrf_dfs[name], lm_model, lm_tokenizer)
+                       for name in DATASETS}
+    greedy_baselines = {name: score_greedy(name, greedy_dfs[name], lm_model, lm_tokenizer)
+                        for name in DATASETS}
 
     if lm_model is not None:
         del lm_model, lm_tokenizer; torch.cuda.empty_cache()
@@ -269,11 +350,12 @@ def main():
     results = {}
     for name, cfg in DATASETS.items():
         front_df = stage5_rerank(name, scored_dfs[name])
-        plot_single(name, cfg["label"], front_df, scored_dfs[name])
-        results[name] = (front_df, scored_dfs[name], cfg["label"])
+        plot_single(name, cfg["label"], front_df, greedy_baselines[name])
+        results[name] = (front_df, greedy_baselines[name], cfg["label"])
 
     plot_combined(results)
     print("Done.")
+
 
 if __name__ == "__main__":
     main()

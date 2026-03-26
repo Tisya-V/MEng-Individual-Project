@@ -3,11 +3,12 @@
 # Evaluates each fine-tuned LoRA model (greedy decode) and plots its
 # (adequacy, fluency) operating point on the existing oracle A-F fronts.
 #
-# Reads:   runs/n{N}_k{K}/results/{name}_af_front.csv  (existing fronts)
-#          runs/n{N}_k{K}/results/{name}_scored_flu.jsonl (for baselines)
+# Reads:   runs/n{N}_k{K}/results/{name}_af_front.csv   (existing fronts)
+#          runs/n{N}_k{K}/data/{name}_greedy_scored.jsonl (beam baselines)
 #          data/splits/{name}_dev.csv
 #          models/{name}/  (LoRA adapters)
 # Writes:  runs/n{N}_k{K}/results/finetuned_on_front.png
+
 
 import torch
 import pandas as pd
@@ -21,20 +22,23 @@ from peft import PeftModel
 import sacrebleu
 from config import *
 
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 def score_adequacy(hyps, refs):
     metric = sacrebleu.CHRF()
     return np.mean([metric.sentence_score(h, [r]).score for h, r in zip(hyps, refs)])
+
 
 def score_fluency(hyps, lm_model, lm_tokenizer):
     losses = []
     empty = sum(1 for h in hyps if not h or not h.strip())
     for h in tqdm(hyps, desc="  fluency"):
         if not h or not h.strip():
-            continue  # skip empty hypotheses
+            continue
         enc = lm_tokenizer(h, return_tensors="pt", truncation=True, max_length=256).to(device)
         with torch.no_grad():
             loss = lm_model(**enc, labels=enc["input_ids"]).loss.item()
@@ -57,22 +61,21 @@ def evaluate_model(name, eval_df, mt_model, mt_tokenizer, lm_model, lm_tokenizer
                 max_length=None,
             )
         hyps.append(mt_tokenizer.decode(out[0], skip_special_tokens=True))
-
     refs = eval_df["ref_fr"].tolist()
     adq = score_adequacy(hyps, refs)
     flu, empty = score_fluency(hyps, lm_model, lm_tokenizer)
     return adq, flu, empty
 
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # Load LM once
     print(f"Loading LM: {LM_MODEL}")
     lm_tokenizer = AutoTokenizer.from_pretrained(LM_MODEL)
     lm_model     = AutoModelForCausalLM.from_pretrained(LM_MODEL).to(device)
     lm_model.eval()
 
-    points = {}   # name -> (adq, flu)
+    points = {}  # name -> (adq, flu)
 
     for name in DATASETS:
         adapter_dir = MODELS_DIR / name
@@ -100,23 +103,35 @@ def main():
     colours = cm.tab10.colors
     fig, ax = plt.subplots(figsize=(9, 6))
 
-    for i, (name, label) in enumerate(DATASETS.items()):
-        front_path = RESULT_DIR / f"{name}_af_front.csv"
-        scored_path = RUN_DIR / "data" / f"{name}_scored_flu.jsonl"
+    for i, (name, cfg) in enumerate(DATASETS.items()):
+        label = cfg["label"]
+        front_path  = RESULT_DIR / f"{name}_af_front.csv"
+        greedy_path = DATA_DIR   / f"{name}_greedy_scored.jsonl"
+
         if not front_path.exists():
+            print(f"[{name}] No front CSV found, skipping.")
+            continue
+        if not greedy_path.exists():
+            print(f"[{name}] No greedy scored file found — run pipeline_af_front.py first.")
             continue
 
         front_df  = pd.read_csv(front_path)
-        scored_df = pd.read_json(scored_path, orient="records", lines=True)
-        baseline_chrf    = scored_df.groupby("id")["chrf"].mean().mean()
-        baseline_fluency = scored_df.groupby("id")["fluency"].mean().mean()
+        greedy_df = pd.read_json(greedy_path, orient="records", lines=True)
+        baseline_chrf    = greedy_df["chrf"].mean()
+        baseline_fluency = greedy_df["fluency"].mean()
 
         c = colours[i]
+
+        # Oracle front
         ax.plot(front_df["chrf"], front_df["fluency"],
                 color=c, linewidth=2, alpha=0.7, label=f"{label} — oracle front")
-        ax.scatter([baseline_chrf], [baseline_fluency],
-                   marker="x", s=120, linewidths=2, color=c, zorder=4)
 
+        # Beam decode baseline (×)
+        ax.scatter([baseline_chrf], [baseline_fluency],
+                   marker="x", s=120, linewidths=2, color=c, zorder=4,
+                   label=f"{label} — beam baseline")
+
+        # Fine-tuned greedy (★)
         if name in points:
             adq, flu = points[name]
             ax.scatter([adq], [flu], marker="*", s=250, color=c, zorder=5,
@@ -124,13 +139,17 @@ def main():
 
     ax.set_xlabel("Adequacy (chrF)")
     ax.set_ylabel("Fluency (neg-NLL)")
-    ax.set_title(f"Fine-tuned Models on A-F Oracle Fronts (N={N}, K={K})\n× = mean candidate baseline  ★ = fine-tuned model")
+    ax.set_title(
+        f"Fine-tuned Models on A-F Oracle Fronts (N={N}, K={K})\n"
+        f"× = beam decode baseline   ★ = fine-tuned model"
+    )
     ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
     plt.tight_layout()
     out = RESULT_DIR / "finetuned_on_front.png"
     plt.savefig(str(out), dpi=150)
     plt.close()
     print(f"\nSaved to {out}")
+
 
 if __name__ == "__main__":
     main()

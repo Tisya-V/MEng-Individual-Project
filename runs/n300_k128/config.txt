@@ -1,0 +1,13 @@
+SEED        = 42
+N           = 300
+K           = 128
+MAX_NEW_TOK = 128
+TOP_P       = 0.9
+TEMPERATURE = 1.0
+
+MT_MODEL    = facebook/mbart-large-50-many-to-many-mmt
+LM_MODEL    = asi/gpt-fr-cased-small
+SRC_LANG    = en_XX
+TGT_LANG    = fr_XX
+
+BETAS       = [0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 50.0, 100.0, 1000.0, 10000.0]

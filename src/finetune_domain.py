@@ -123,7 +123,6 @@ def train_domain(domain: str):
     print(f"[{domain}] Loading tokeniser + model...")
     tokenizer = MBart50TokenizerFast.from_pretrained(MT_MODEL)
     tokenizer.src_lang = SRC_LANG
-    forced_bos = tokenizer.lang_code_to_id[TGT_LANG]
 
 
     model = MBartForConditionalGeneration.from_pretrained(MT_MODEL)
@@ -155,7 +154,7 @@ def train_domain(domain: str):
         train_loss = 0.0
         for batch in tqdm(train_dl, desc=f"[{domain}] Epoch {epoch}/{MAX_EPOCHS} train"):
             batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(**batch, forced_bos_token_id=forced_bos)
+            outputs = model(**batch)
             loss = outputs.loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -172,7 +171,7 @@ def train_domain(domain: str):
         with torch.no_grad():
             for batch in tqdm(val_dl, desc=f"[{domain}] Epoch {epoch}/{MAX_EPOCHS} val"):
                 batch = {k: v.to(device) for k, v in batch.items()}
-                val_loss += model(**batch, forced_bos_token_id=forced_bos).loss.item()
+                val_loss += model(**batch).loss.item()
         val_loss /= len(val_dl)
 
 

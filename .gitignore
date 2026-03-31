@@ -2,11 +2,11 @@
 
 # ignore data files (e.g. eval sets, intermediate CSVs)
 *.jsonl
+*.csv
 
 data/splits/
 tmp/
 runs/*/data/
-runs/*/results/*.csv
 build/
 *.egg-info/
 __pycache__

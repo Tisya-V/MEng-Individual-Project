@@ -26,5 +26,3 @@ DATASETS = {
 SPLITS_DIR = Path("data/splits")
 MODELS_DIR = Path("models")
 RUN_DIR    = Path(f"runs/n{N}_k{K}")
-DATA_DIR   = RUN_DIR / "data"
-RESULT_DIR = RUN_DIR / "results"

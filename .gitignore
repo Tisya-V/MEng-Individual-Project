@@ -10,3 +10,4 @@ runs/*/data/
 build/
 *.egg-info/
 __pycache__
+runs/*/mrt/*/lambda*

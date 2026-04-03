@@ -14,6 +14,9 @@ from af_front_pipeline_stages import (
     score_adequacy, score_fluency, score_greedy, rerank,
 )
 
+DATA_DIR   = RUN_DIR / "baseline" / "data"
+RESULT_DIR = RUN_DIR / "baseline" / "results"
+
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
